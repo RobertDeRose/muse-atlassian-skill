@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""Confluence Cloud CLI for the Muse confluence skill.
+
+Auth comes from the `custom.confluence` connector via dynamic credential
+surrogates -- never paste or store the API token here.
+
+The connector holds the full `Authorization` header value:
+`Basic base64(email:api_token)` -- including the `Basic ` prefix.
+"""
+import json
+import sys
+import urllib.parse
+import urllib.request
+
+sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
+from dynamic_credentials import (  # noqa: E402
+    add_surrogate_to_request,
+    read_json_response,
+)
+
+def _load_host():
+    import os
+    cfg = os.path.expanduser("~/.config/confluence-skill/config.json")
+    try:
+        with open(cfg) as f:
+            return json.load(f)["host"]
+    except (OSError, KeyError, ValueError):
+        pass
+    host = os.environ.get("CONFLUENCE_HOST", "")
+    if not host:
+        sys.exit(
+            "Confluence host not configured. Create ~/.config/confluence-skill/config.json "
+            'with {"host": "YOUR-SITE.atlassian.net"} or set CONFLUENCE_HOST.'
+        )
+    return host
+
+
+HOST = _load_host()
+BASE = f"https://{HOST}/wiki/rest/api"
+CRED = "custom.confluence"
+
+
+def api(method, path, body=None):
+    url = BASE + path
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Accept", "application/json")
+    if data:
+        req.add_header("Content-Type", "application/json")
+    add_surrogate_to_request(req, CRED, allowed_hosts=[HOST])
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        if resp.status == 204:
+            return {}
+        return read_json_response(resp)
+
+
+def cmd_me(_args):
+    me = api("GET", "/user/current")
+    print(f"{me.get('displayName')} <{me.get('email')}> ({me.get('accountId')})")
+
+
+def cmd_search(args):
+    params = {"cql": args.cql, "limit": args.max, "expand": "version"}
+    r = api("GET", "/content/search?" + urllib.parse.urlencode(params))
+    results = r.get("results", [])
+    print(f"{r.get('totalSize', len(results))} results")
+    for p in results:
+        ver = (p.get("version") or {}).get("number", "?")
+        print(f"{p['id']} [v{ver}] {p.get('title','')[:70]}")
+
+
+def cmd_get(args):
+    p = api("GET", f"/content/{args.id}?expand=body.storage,version,space")
+    print(f"{p['id']}: {p.get('title')}")
+    print(f"  space: {(p.get('space') or {}).get('key')}  version: {(p.get('version') or {}).get('number')}")
+    body = ((p.get("body") or {}).get("storage") or {}).get("value", "")
+    if body:
+        # strip tags for a quick preview
+        import re
+        text = re.sub(r"<[^>]+>", " ", body)
+        text = re.sub(r"\s+", " ", text).strip()
+        if text:
+            print(f"  body: {text[:500]}")
+
+
+def cmd_create(args):
+    payload = {
+        "type": "page",
+        "title": args.title,
+        "space": {"key": args.space},
+        "body": {"storage": {"value": args.body, "representation": "storage"}},
+    }
+    if args.parent:
+        payload["ancestors"] = [{"id": args.parent}]
+    r = api("POST", "/content", payload)
+    print(f"created {r['id']}: {r.get('title')}")
+
+
+def cmd_update(args):
+    cur = api("GET", f"/content/{args.id}?expand=version")
+    ver = (cur.get("version") or {}).get("number", 1)
+    payload = {
+        "version": {"number": ver + 1},
+        "title": args.title or cur.get("title"),
+        "type": "page",
+        "body": {"storage": {"value": args.body, "representation": "storage"}},
+    }
+    r = api("PUT", f"/content/{args.id}", payload)
+    print(f"updated {r['id']} to v{(r.get('version') or {}).get('number')}")
+
+
+def main():
+    import argparse
+    p = argparse.ArgumentParser(prog="confluence")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("me", help="verify auth / show current user")
+
+    s = sub.add_parser("search", help="search pages with CQL")
+    s.add_argument("--cql", required=True)
+    s.add_argument("--max", type=int, default=25)
+
+    g = sub.add_parser("get", help="show page details")
+    g.add_argument("id")
+
+    c = sub.add_parser("create", help="create a page")
+    c.add_argument("--space", required=True)
+    c.add_argument("--title", required=True)
+    c.add_argument("--body", default="")
+    c.add_argument("--parent", default="")
+
+    u = sub.add_parser("update", help="update a page")
+    u.add_argument("id")
+    u.add_argument("--title", default="")
+    u.add_argument("--body", required=True)
+
+    args = p.parse_args()
+    try:
+        {
+            "me": cmd_me,
+            "search": cmd_search,
+            "get": cmd_get,
+            "create": cmd_create,
+            "update": cmd_update,
+        }[args.cmd](args)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:500]
+        sys.exit(f"HTTP {e.code}: {body}")
+
+
+if __name__ == "__main__":
+    main()
