@@ -8,6 +8,8 @@ you can send to your Muse.
 
 - **jira/** — Jira Cloud: search issues with JQL, read details, create,
   update, comment, and transition issues from chat.
+- **confluence/** — Confluence Cloud: search pages with CQL, read
+  content, create and update pages from chat.
 
 ## Install
 
